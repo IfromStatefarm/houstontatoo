@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Houston Auto-Tattoo Extension",
+  "version": "1.0.0",
+  "description": "Automates Tattoo ON/OFF sequencing for live events on Sencha ExtJS dashboards.",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "<houston.flosports.net/#dashboard/events/list//>"
+  ],
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content_script.js"],
+      "run_at": "document_end"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["styles.css"],
+      "matches": ["<all_urls>"]
+    }
+  ]
+}
