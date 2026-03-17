@@ -52,14 +52,13 @@ class ExtJSAPI {
     }
 
     static forceClose() {
-        // Resiliency Update: Force close modal if hung.
+        // Force close modal if hung.
         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
         const closeBtn = document.querySelector('.x-window:not([style*="display: none"]) .x-tool-close');
         if (closeBtn) closeBtn.click();
     }
 
     static async clickGearAndEdit(recordId) {
-        // Virtual scroll logic: ensure row is in DOM and view
         let row = document.querySelector(`.x-gridrow[data-recordid="${recordId}"]`);
         if (!row) {
             console.warn(`[Houston] Row ${recordId} not in DOM. Attempting to scroll grid...`);
@@ -71,16 +70,18 @@ class ExtJSAPI {
         }
 
         row.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        await sleep(300); // Allow smooth scroll to settle
+        await sleep(300);
 
-        const gearIcon = row.querySelector('.gear-icon, [data-qtip*="Edit"], .x-action-col-icon');
+        // Gear Icon Selector (fa-cog) based on screenshots
+        const gearIcon = row.querySelector('.fa-cog, .x-action-col-icon, [data-qtip*="Edit"]');
         if (!gearIcon) return false;
         gearIcon.click();
         
-        await sleep(500); 
+        await sleep(600); 
         
+        // Finder for dropdown menu (text matching "Edit")
         const editMenuOption = document.evaluate(
-            "//span[contains(text(), 'Edit')]", 
+            "//div[contains(@class, 'x-menu')]//span[contains(text(), 'Edit')] | //span[contains(text(), 'Edit')]", 
             document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
         ).singleNodeValue;
 
@@ -98,37 +99,33 @@ class ExtJSAPI {
     }
 
     static async toggleTattooCheckbox(targetStateON) {
-        // Selector Reliability Update: Target standard ExtJS label classes instead of pure text structure
-        const labelXPath = "//label[contains(@class, 'x-form-cb-label') and contains(text(), 'Enable Tattoo')]";
-        const labelEl = document.evaluate(labelXPath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+        // Selector based on screenshots: look for label containing "Enable Tattoo"
+        const labelXPath = "//span[contains(@class, 'x-label-text-el') and contains(text(), 'Enable Tattoo')]";
+        const textSpan = document.evaluate(labelXPath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
         
-        if (!labelEl) return false;
+        if (!textSpan) return false;
 
-        const formItem = labelEl.closest('.x-form-item') || labelEl.closest('.x-field');
-        const checkboxEl = formItem ? formItem.querySelector('.x-form-checkbox, input[type="button"], input[type="checkbox"]') : null;
+        const fieldWrapper = textSpan.closest('.x-checkboxfield');
+        if (!fieldWrapper) return false;
 
-        if (!checkboxEl) return false;
-
-        // Check if it's already in the target state
-        const isCurrentlyON = checkboxEl.className.includes('cb-checked') || checkboxEl.checked || (formItem && formItem.className.includes('x-form-cb-checked'));
+        const isCurrentlyON = fieldWrapper.classList.contains('x-checked');
 
         if (isCurrentlyON !== targetStateON) {
-            ['mousedown', 'mouseup', 'click'].forEach(eventType => {
-                const event = new MouseEvent(eventType, { bubbles: true, cancelable: true });
-                checkboxEl.dispatchEvent(event);
-            });
-            await sleep(300);
+            const clickTarget = fieldWrapper.querySelector('.x-input-el, .x-icon-el');
+            if (clickTarget) {
+                clickTarget.click();
+                await sleep(400);
+            }
         }
         return true;
     }
 
     static async saveAndCloseModal() {
-        const saveXPath = "//div[contains(@class, 'x-window')]//span[text()='Save' or text()='Submit']";
-        const saveBtn = document.evaluate(saveXPath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+        // Target data-componentid="save" as seen in inspector
+        const saveBtn = document.querySelector('.x-window:not([style*="display: none"]) [data-componentid="save"] .x-button-el, .x-window:not([style*="display: none"]) [data-componentid="save"]');
         
         if (saveBtn) {
             saveBtn.click();
-            // Resiliency Update: 10s Timeout Guard
             const maskCleared = await this.waitForMaskClear(10000);
             if (!maskCleared) {
                 console.warn("[Houston] Save mask timed out. Triggering forceClose.");
@@ -136,10 +133,18 @@ class ExtJSAPI {
                 await sleep(1000);
             }
         } else {
-            this.forceClose();
+            // Fallback text matching
+            const saveXPath = "//div[contains(@class, 'x-window')]//div[contains(@class, 'x-text-el') and (text()='Save' or text()='Submit')]";
+            const saveText = document.evaluate(saveXPath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+            if (saveText) {
+                saveText.click();
+                await this.waitForMaskClear(10000);
+            } else {
+                this.forceClose();
+            }
         }
         
-        // Ensure modal is completely removed
+        await sleep(500);
         let modal = document.querySelector('.x-window:not([style*="display: none"])');
         if (modal) {
             this.forceClose();
@@ -186,7 +191,7 @@ class HoustonHUD {
             </div>
             <div class="hud-body">
                 <div class="timer-box">
-                    <div class="label" id="timer-label">AWAITING EVENTS</div>
+                    <div class="label" id="timer-label">AWAITING LIVE EVENTS</div>
                     <div class="time" id="timer-value">--:--</div>
                 </div>
                 <div class="queue-section">
@@ -202,33 +207,42 @@ class HoustonHUD {
         `;
         this.shadow.appendChild(wrapper);
 
-        // Defer binding until engine is initialized
         setTimeout(() => {
-            this.shadow.getElementById('btn-stop').addEventListener('click', () => engine.emergencyStop());
-            this.shadow.getElementById('btn-skip').addEventListener('click', () => engine.skipCurrent = true);
-            this.shadow.getElementById('btn-purge').addEventListener('click', () => engine.purgeMemory());
+            const stopBtn = this.shadow.getElementById('btn-stop');
+            const skipBtn = this.shadow.getElementById('btn-skip');
+            const purgeBtn = this.shadow.getElementById('btn-purge');
+            if(stopBtn) stopBtn.addEventListener('click', () => engine.emergencyStop());
+            if(skipBtn) skipBtn.addEventListener('click', () => engine.skipCurrent = true);
+            if(purgeBtn) purgeBtn.addEventListener('click', () => engine.purgeMemory());
         }, 500);
     }
 
     updateStatus(statusStr, colorClass) {
         const dot = this.shadow.getElementById('status-dot');
         const text = this.shadow.getElementById('status-text');
-        dot.className = `dot ${colorClass}`;
-        text.innerText = statusStr;
+        if(dot && text) {
+            dot.className = `dot ${colorClass}`;
+            text.innerText = statusStr;
+        }
     }
 
     updateTimer(label, secondsRemaining) {
-        this.shadow.getElementById('timer-label').innerText = label;
+        const labelEl = this.shadow.getElementById('timer-label');
+        const valueEl = this.shadow.getElementById('timer-value');
+        if(!labelEl || !valueEl) return;
+
+        labelEl.innerText = label;
         if (secondsRemaining < 0) {
-            this.shadow.getElementById('timer-value').innerText = "--:--";
+            valueEl.innerText = "--:--";
         } else {
             const s = Math.ceil(secondsRemaining);
-            this.shadow.getElementById('timer-value').innerText = `00:${s.toString().padStart(2, '0')}`;
+            valueEl.innerText = `00:${s.toString().padStart(2, '0')}`;
         }
     }
 
     updateQueue(batchA, batchB) {
         const list = this.shadow.getElementById('queue-list');
+        if(!list) return;
         list.innerHTML = '';
         const allItems = [...batchA.map(id => ({id, b: 'A'})), ...batchB.map(id => ({id, b: 'B'}))];
         
@@ -282,7 +296,7 @@ class HoustonHUD {
 class HoustonEngine {
     constructor() {
         this.hud = new HoustonHUD();
-        this.state = 'IDLE'; // IDLE, BATCH_A_WAIT, PROCESS_A_ON, HOLD_30, PROCESS_A_OFF
+        this.state = 'IDLE'; 
         this.batchA = [];
         this.batchB = [];
         this.batchBTimerEnd = 0;
@@ -328,16 +342,16 @@ class HoustonEngine {
         this.hud.updateQueue([], []);
     }
 
-    // --- Core Observer Trigger ---
     initObserver() {
         const config = { childList: true, subtree: true, characterData: true };
         this.observer = new MutationObserver((mutations) => {
             if (this.stopped) return;
             
-            // Look for cells in rows that say "Live"
-            const liveCells = document.querySelectorAll('.x-gridrow .x-grid-cell-inner');
-            liveCells.forEach(cell => {
-                if (cell.innerText.trim().toLowerCase() === 'live') {
+            // DETECTION LOGIC: ONLY trigger on "Live"
+            const cells = document.querySelectorAll('.x-grid-cell-inner, .x-gridcell-body-el');
+            cells.forEach(cell => {
+                const txt = cell.innerText.trim().toLowerCase();
+                if (txt === 'live') { // Strictly only 'live'
                     const row = cell.closest('.x-gridrow');
                     if (row) {
                         const recordId = row.getAttribute('data-recordid');
@@ -358,12 +372,10 @@ class HoustonEngine {
         } else if (this.state === 'BATCH_A_WAIT' || this.state === 'PROCESS_A_ON') {
             this.batchA.push(recordId);
         } else if (this.state === 'HOLD_30') {
-            // Phase 3: Late Arrivals - Add to Batch A and immediately process it ON.
             this.batchA.push(recordId);
             this.hud.updateQueue(this.batchA, this.batchB);
             await this.executeAction(recordId, true);
         } else if (this.state === 'PROCESS_A_OFF') {
-            // Phase 5: Batch B (Simultaneous Handling)
             this.batchB.push(recordId);
             if (this.batchBTimerEnd === 0) {
                 this.batchBTimerEnd = Date.now() + 15000;
@@ -382,7 +394,7 @@ class HoustonEngine {
     updateHUD() {
         if (this.stopped) return;
         
-        let label = 'AWAITING EVENTS';
+        let label = 'AWAITING LIVE';
         let remain = -1;
         let status = 'IDLE';
         let color = 'idle';
@@ -415,7 +427,6 @@ class HoustonEngine {
             await sleep(500);
             this.updateHUD();
 
-            // Safety & Error Handling: Manual Pause Check
             if (ExtJSAPI.isUserModalOpen() && (this.state === 'PROCESS_A_ON' || this.state === 'PROCESS_A_OFF')) {
                 this.hud.updateStatus('PAUSED (User Modal)', 'waiting');
                 continue;
@@ -439,7 +450,6 @@ class HoustonEngine {
                 }
             } 
             else if (this.state === 'PROCESS_A_OFF') {
-                // Phase 4: Tattoo OFF Cleanup loop
                 for (let id of [...this.batchA]) {
                     if (this.skipCurrent) { this.skipCurrent = false; continue; }
                     await this.executeAction(id, false);
@@ -449,11 +459,9 @@ class HoustonEngine {
                 this.batchA = [];
                 await this.saveState();
 
-                // Phase 5 Check for Batch B
                 if (this.batchB.length > 0) {
                     this.batchA = [...this.batchB];
                     this.batchB = [];
-                    // Check if Batch B 15s timer already expired during Phase 4
                     const remaining = Math.max(0, (this.batchBTimerEnd - Date.now()) / 1000);
                     this.transitionTo('BATCH_A_WAIT', remaining);
                     this.batchBTimerEnd = 0;
@@ -485,7 +493,6 @@ class HoustonEngine {
     }
 }
 
-// Initialization
 let engine;
 window.addEventListener('load', () => {
     engine = new HoustonEngine();
