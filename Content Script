@@ -51,12 +51,18 @@ class ExtJSAPI {
         return false; // Timed out
     }
 
+    static forceClose() {
+        // Resiliency Update: Force close modal if hung.
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }));
+        const closeBtn = document.querySelector('.x-window:not([style*="display: none"]) .x-tool-close');
+        if (closeBtn) closeBtn.click();
+    }
+
     static async clickGearAndEdit(recordId) {
         // Virtual scroll logic: ensure row is in DOM and view
         let row = document.querySelector(`.x-gridrow[data-recordid="${recordId}"]`);
         if (!row) {
             console.warn(`[Houston] Row ${recordId} not in DOM. Attempting to scroll grid...`);
-            // ExtJS virtual scrolling workaround: Try to scroll the main grid body slightly to force render
             const gridBody = document.querySelector('.x-grid-item-container') || document.body;
             gridBody.scrollBy(0, 100);
             await sleep(500);
@@ -67,14 +73,12 @@ class ExtJSAPI {
         row.scrollIntoView({ behavior: 'smooth', block: 'center' });
         await sleep(300); // Allow smooth scroll to settle
 
-        // Click Gear Icon. (Adjust selector based on exact ExtJS implementation)
         const gearIcon = row.querySelector('.gear-icon, [data-qtip*="Edit"], .x-action-col-icon');
         if (!gearIcon) return false;
         gearIcon.click();
         
-        await sleep(500); // Wait for potential ExtJS menu to drop down
+        await sleep(500); 
         
-        // If it opens a menu, find the Edit option
         const editMenuOption = document.evaluate(
             "//span[contains(text(), 'Edit')]", 
             document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
@@ -84,7 +88,6 @@ class ExtJSAPI {
             editMenuOption.click();
         }
 
-        // Wait for modal to appear
         const start = Date.now();
         while (Date.now() - start < 5000) {
             const win = document.querySelector('.x-window:not([style*="display: none"])');
@@ -95,23 +98,21 @@ class ExtJSAPI {
     }
 
     static async toggleTattooCheckbox(targetStateON) {
-        // Find label "Enable Tattoo"
-        const labelXPath = "//label[contains(text(), 'Enable Tattoo')]";
+        // Selector Reliability Update: Target standard ExtJS label classes instead of pure text structure
+        const labelXPath = "//label[contains(@class, 'x-form-cb-label') and contains(text(), 'Enable Tattoo')]";
         const labelEl = document.evaluate(labelXPath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
         
         if (!labelEl) return false;
 
-        // In ExtJS, the actual input or the stylized div is usually previous sibling or parent container
-        const formItem = labelEl.closest('.x-form-item');
-        const checkboxEl = formItem ? formItem.querySelector('.x-form-checkbox, input[type="checkbox"]') : null;
+        const formItem = labelEl.closest('.x-form-item') || labelEl.closest('.x-field');
+        const checkboxEl = formItem ? formItem.querySelector('.x-form-checkbox, input[type="button"], input[type="checkbox"]') : null;
 
         if (!checkboxEl) return false;
 
-        // Check current state (ExtJS adds classes like .x-form-cb-checked)
-        const isCurrentlyON = checkboxEl.className.includes('cb-checked') || checkboxEl.checked;
+        // Check if it's already in the target state
+        const isCurrentlyON = checkboxEl.className.includes('cb-checked') || checkboxEl.checked || (formItem && formItem.className.includes('x-form-cb-checked'));
 
         if (isCurrentlyON !== targetStateON) {
-            // Simulate full click for Sencha
             ['mousedown', 'mouseup', 'click'].forEach(eventType => {
                 const event = new MouseEvent(eventType, { bubbles: true, cancelable: true });
                 checkboxEl.dispatchEvent(event);
@@ -127,19 +128,21 @@ class ExtJSAPI {
         
         if (saveBtn) {
             saveBtn.click();
-            // 10s Timeout Guard for "Saving..."
+            // Resiliency Update: 10s Timeout Guard
             const maskCleared = await this.waitForMaskClear(10000);
             if (!maskCleared) {
-                console.warn("[Houston] Save mask timed out. Triggering ESC to cancel.");
-                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+                console.warn("[Houston] Save mask timed out. Triggering forceClose.");
+                this.forceClose();
                 await sleep(1000);
             }
+        } else {
+            this.forceClose();
         }
         
         // Ensure modal is completely removed
         let modal = document.querySelector('.x-window:not([style*="display: none"])');
         if (modal) {
-            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+            this.forceClose();
         }
     }
 }
@@ -199,10 +202,12 @@ class HoustonHUD {
         `;
         this.shadow.appendChild(wrapper);
 
-        // Bind buttons
-        this.shadow.getElementById('btn-stop').addEventListener('click', () => engine.emergencyStop());
-        this.shadow.getElementById('btn-skip').addEventListener('click', () => engine.skipCurrent = true);
-        this.shadow.getElementById('btn-purge').addEventListener('click', () => engine.purgeMemory());
+        // Defer binding until engine is initialized
+        setTimeout(() => {
+            this.shadow.getElementById('btn-stop').addEventListener('click', () => engine.emergencyStop());
+            this.shadow.getElementById('btn-skip').addEventListener('click', () => engine.skipCurrent = true);
+            this.shadow.getElementById('btn-purge').addEventListener('click', () => engine.purgeMemory());
+        }, 500);
     }
 
     updateStatus(statusStr, colorClass) {
@@ -277,26 +282,25 @@ class HoustonHUD {
 class HoustonEngine {
     constructor() {
         this.hud = new HoustonHUD();
-        this.state = 'IDLE'; // IDLE, BATCH_A_WAIT, PROCESS_A_ON, HOLD_30, PROCESS_A_OFF, BATCH_B_WAIT
+        this.state = 'IDLE'; // IDLE, BATCH_A_WAIT, PROCESS_A_ON, HOLD_30, PROCESS_A_OFF
         this.batchA = [];
         this.batchB = [];
+        this.batchBTimerEnd = 0;
         this.processedHistory = new Set();
         
         this.timerEnd = 0;
-        this.activeTimerType = null; // '15s', '30s'
         this.skipCurrent = false;
         this.stopped = false;
 
-        this.loadState();
-        this.startHUDLoop();
-        this.initObserver();
+        this.loadState().then(() => {
+            this.initObserver();
+            this.startEngineLoop();
+        });
     }
 
     async loadState() {
         const data = await chrome.storage.local.get(['houstonState']);
         if (data.houstonState) {
-            // Restore basic queues. Complex timer restoration omitted for safety 
-            // to avoid triggering stale actions on a refreshed, outdated DOM.
             this.processedHistory = new Set(data.houstonState.history || []);
             console.log("[Houston] State loaded from storage.");
         }
@@ -308,7 +312,181 @@ class HoustonEngine {
         });
     }
 
+    emergencyStop() {
+        this.stopped = true;
+        this.hud.updateStatus('STOPPED', 'idle');
+        this.hud.updateTimer('SYSTEM HALTED', -1);
+        ExtJSAPI.forceClose();
+    }
+
+    async purgeMemory() {
+        this.processedHistory.clear();
+        this.batchA = [];
+        this.batchB = [];
+        this.state = 'IDLE';
+        await this.saveState();
+        this.hud.updateQueue([], []);
+    }
+
     // --- Core Observer Trigger ---
     initObserver() {
-        const targetNode = document.body;
-        const config = { childList: true,
+        const config = { childList: true, subtree: true, characterData: true };
+        this.observer = new MutationObserver((mutations) => {
+            if (this.stopped) return;
+            
+            // Look for cells in rows that say "Live"
+            const liveCells = document.querySelectorAll('.x-gridrow .x-grid-cell-inner');
+            liveCells.forEach(cell => {
+                if (cell.innerText.trim().toLowerCase() === 'live') {
+                    const row = cell.closest('.x-gridrow');
+                    if (row) {
+                        const recordId = row.getAttribute('data-recordid');
+                        if (recordId && !this.processedHistory.has(recordId) && !this.batchA.includes(recordId) && !this.batchB.includes(recordId)) {
+                            this.handleLiveEventDetected(recordId);
+                        }
+                    }
+                }
+            });
+        });
+        this.observer.observe(document.body, config);
+    }
+
+    async handleLiveEventDetected(recordId) {
+        if (this.state === 'IDLE') {
+            this.batchA.push(recordId);
+            this.transitionTo('BATCH_A_WAIT', 15);
+        } else if (this.state === 'BATCH_A_WAIT' || this.state === 'PROCESS_A_ON') {
+            this.batchA.push(recordId);
+        } else if (this.state === 'HOLD_30') {
+            // Phase 3: Late Arrivals - Add to Batch A and immediately process it ON.
+            this.batchA.push(recordId);
+            this.hud.updateQueue(this.batchA, this.batchB);
+            await this.executeAction(recordId, true);
+        } else if (this.state === 'PROCESS_A_OFF') {
+            // Phase 5: Batch B (Simultaneous Handling)
+            this.batchB.push(recordId);
+            if (this.batchBTimerEnd === 0) {
+                this.batchBTimerEnd = Date.now() + 15000;
+            }
+        }
+        this.hud.updateQueue(this.batchA, this.batchB);
+    }
+
+    transitionTo(newState, seconds) {
+        this.state = newState;
+        if (seconds) {
+            this.timerEnd = Date.now() + (seconds * 1000);
+        }
+    }
+
+    updateHUD() {
+        if (this.stopped) return;
+        
+        let label = 'AWAITING EVENTS';
+        let remain = -1;
+        let status = 'IDLE';
+        let color = 'idle';
+
+        if (this.state === 'BATCH_A_WAIT') {
+            label = 'BATCHING (15s)';
+            remain = (this.timerEnd - Date.now()) / 1000;
+            status = 'WAITING'; color = 'waiting';
+        } else if (this.state === 'PROCESS_A_ON') {
+            label = 'TATTOO ON';
+            remain = -1;
+            status = 'PROCESSING'; color = 'processing';
+        } else if (this.state === 'HOLD_30') {
+            label = 'HOLD TIMER (30s)';
+            remain = (this.timerEnd - Date.now()) / 1000;
+            status = 'HOLDING'; color = 'waiting';
+        } else if (this.state === 'PROCESS_A_OFF') {
+            label = 'TATTOO OFF';
+            remain = -1;
+            status = 'CLEANING UP'; color = 'processing';
+        }
+
+        this.hud.updateTimer(label, remain);
+        this.hud.updateStatus(status, color);
+        this.hud.updateQueue(this.batchA, this.batchB);
+    }
+
+    async startEngineLoop() {
+        while (!this.stopped) {
+            await sleep(500);
+            this.updateHUD();
+
+            // Safety & Error Handling: Manual Pause Check
+            if (ExtJSAPI.isUserModalOpen() && (this.state === 'PROCESS_A_ON' || this.state === 'PROCESS_A_OFF')) {
+                this.hud.updateStatus('PAUSED (User Modal)', 'waiting');
+                continue;
+            }
+
+            if (this.state === 'BATCH_A_WAIT') {
+                if (Date.now() >= this.timerEnd) {
+                    this.transitionTo('PROCESS_A_ON', 0);
+                }
+            } 
+            else if (this.state === 'PROCESS_A_ON') {
+                for (let id of [...this.batchA]) {
+                    if (this.skipCurrent) { this.skipCurrent = false; continue; }
+                    await this.executeAction(id, true);
+                }
+                this.transitionTo('HOLD_30', 30);
+            } 
+            else if (this.state === 'HOLD_30') {
+                if (Date.now() >= this.timerEnd) {
+                    this.transitionTo('PROCESS_A_OFF', 0);
+                }
+            } 
+            else if (this.state === 'PROCESS_A_OFF') {
+                // Phase 4: Tattoo OFF Cleanup loop
+                for (let id of [...this.batchA]) {
+                    if (this.skipCurrent) { this.skipCurrent = false; continue; }
+                    await this.executeAction(id, false);
+                    this.processedHistory.add(id);
+                }
+                
+                this.batchA = [];
+                await this.saveState();
+
+                // Phase 5 Check for Batch B
+                if (this.batchB.length > 0) {
+                    this.batchA = [...this.batchB];
+                    this.batchB = [];
+                    // Check if Batch B 15s timer already expired during Phase 4
+                    const remaining = Math.max(0, (this.batchBTimerEnd - Date.now()) / 1000);
+                    this.transitionTo('BATCH_A_WAIT', remaining);
+                    this.batchBTimerEnd = 0;
+                } else {
+                    this.transitionTo('IDLE', 0);
+                }
+            }
+        }
+    }
+
+    async executeAction(recordId, targetStateON) {
+        await extJsMutex.acquire();
+        try {
+            const opened = await ExtJSAPI.clickGearAndEdit(recordId);
+            if (opened) {
+                const toggled = await ExtJSAPI.toggleTattooCheckbox(targetStateON);
+                if (toggled) {
+                    await ExtJSAPI.saveAndCloseModal();
+                } else {
+                    ExtJSAPI.forceClose();
+                }
+            }
+        } catch (e) {
+            console.error("[Houston] Error processing action for", recordId, e);
+            ExtJSAPI.forceClose();
+        } finally {
+            extJsMutex.release();
+        }
+    }
+}
+
+// Initialization
+let engine;
+window.addEventListener('load', () => {
+    engine = new HoustonEngine();
+});
