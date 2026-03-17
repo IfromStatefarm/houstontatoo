@@ -304,7 +304,7 @@ class HoustonHUD {
             isDragging = true;
             header.classList.add('dragging');
             hud.classList.add('dragging'); // Applies user-select: none
-            header.setPointerCapture(e.pointerId);
+            try { header.setPointerCapture(e.pointerId); } catch(err) {}
         });
 
         header.addEventListener('pointermove', (e) => {
@@ -324,7 +324,7 @@ class HoustonHUD {
             isDragging = false;
             header.classList.remove('dragging');
             hud.classList.remove('dragging');
-            header.releasePointerCapture(e.pointerId);
+            try { header.releasePointerCapture(e.pointerId); } catch(err) {}
         });
     }
 }
@@ -407,23 +407,34 @@ class HoustonEngine {
 
     initObserver() {
         const config = { childList: true, subtree: true, characterData: true };
-        this.observer = new MutationObserver(async (mutations) => {
+        let throttleTimeout = null; // Used to prevent the browser tab from freezing
+
+        this.observer = new MutationObserver((mutations) => {
             if (this.stopped) return;
             
-            const cells = document.querySelectorAll('.x-grid-cell-inner, .x-gridcell-body-el');
-            for (let cell of cells) {
-                const txt = cell.innerText.trim().toLowerCase();
-                if (txt === 'live') { 
-                    const row = cell.closest('.x-gridrow');
-                    if (row) {
-                        const recordId = row.getAttribute('data-recordid');
-                        if (recordId && !this.processedHistory.has(recordId) && !this.batchA.includes(recordId) && !this.batchB.includes(recordId)) {
-                            this.handleNewLiveEvent(recordId);
+            // Throttle ExtJS DOM scanning to run at most once per 500ms
+            if (throttleTimeout) return;
+            
+            throttleTimeout = setTimeout(() => {
+                throttleTimeout = null;
+                if (this.stopped) return;
+
+                const cells = document.querySelectorAll('.x-grid-cell-inner, .x-gridcell-body-el');
+                for (let cell of cells) {
+                    const txt = cell.innerText.trim().toLowerCase();
+                    if (txt === 'live') { 
+                        const row = cell.closest('.x-gridrow');
+                        if (row) {
+                            const recordId = row.getAttribute('data-recordid');
+                            if (recordId && !this.processedHistory.has(recordId) && !this.batchA.includes(recordId) && !this.batchB.includes(recordId)) {
+                                this.handleNewLiveEvent(recordId);
+                            }
                         }
                     }
                 }
-            }
+            }, 500);
         });
+        
         this.observer.observe(document.body, config);
     }
 
@@ -491,68 +502,74 @@ class HoustonEngine {
     async startEngineLoop() {
         while (!this.stopped) {
             await sleep(500);
-            this.updateHUD();
+            
+            try {
+                this.updateHUD();
 
-            if (ExtJSAPI.isUserModalOpen(this.currentProcessingId)) {
-                this.hud.updateStatus('PAUSED (User Modal)', 'waiting');
-                continue;
-            }
+                if (ExtJSAPI.isUserModalOpen(this.currentProcessingId)) {
+                    this.hud.updateStatus('PAUSED (User Modal)', 'waiting');
+                    continue;
+                }
 
-            switch (this.state) {
-                case 'BATCH_A_WAIT':
-                    if (Date.now() >= this.timerEndA) {
-                        this.state = 'PROCESS_A_ON';
+                switch (this.state) {
+                    case 'BATCH_A_WAIT':
+                        if (Date.now() >= this.timerEndA) {
+                            this.state = 'PROCESS_A_ON';
+                            this.saveState();
+                        }
+                        break;
+
+                    case 'PROCESS_A_ON':
+                        for (let id of [...this.batchA]) {
+                            if (this.skipCurrent) { this.skipCurrent = false; continue; }
+                            this.currentProcessingId = id;
+                            this.updateHUD();
+                            
+                            await this.executeAction(id, true);
+                            
+                            // Start the 30s hold after the first successful action
+                            if (this.holdTimerEnd === 0) this.holdTimerEnd = Date.now() + 30000;
+                        }
+                        this.currentProcessingId = null;
+                        this.state = 'HOLD_30';
                         this.saveState();
-                    }
-                    break;
+                        break;
 
-                case 'PROCESS_A_ON':
-                    for (let id of [...this.batchA]) {
-                        if (this.skipCurrent) { this.skipCurrent = false; continue; }
-                        this.currentProcessingId = id;
-                        this.updateHUD();
-                        
-                        await this.executeAction(id, true);
-                        
-                        // Start the 30s hold after the first successful action
-                        if (this.holdTimerEnd === 0) this.holdTimerEnd = Date.now() + 30000;
-                    }
-                    this.currentProcessingId = null;
-                    this.state = 'HOLD_30';
-                    this.saveState();
-                    break;
+                    case 'HOLD_30':
+                        if (Date.now() >= this.holdTimerEnd) {
+                            this.state = 'PROCESS_A_OFF';
+                            this.saveState();
+                        }
+                        break;
 
-                case 'HOLD_30':
-                    if (Date.now() >= this.holdTimerEnd) {
-                        this.state = 'PROCESS_A_OFF';
-                        this.saveState();
-                    }
-                    break;
-
-                case 'PROCESS_A_OFF':
-                    for (let id of [...this.batchA]) {
-                        if (this.skipCurrent) { this.skipCurrent = false; continue; }
-                        this.currentProcessingId = id;
-                        this.updateHUD();
+                    case 'PROCESS_A_OFF':
+                        for (let id of [...this.batchA]) {
+                            if (this.skipCurrent) { this.skipCurrent = false; continue; }
+                            this.currentProcessingId = id;
+                            this.updateHUD();
+                            
+                            await this.executeAction(id, false);
+                            this.processedHistory.add(id);
+                        }
+                        this.currentProcessingId = null;
+                        this.batchA = [];
+                        this.holdTimerEnd = 0;
                         
-                        await this.executeAction(id, false);
-                        this.processedHistory.add(id);
-                    }
-                    this.currentProcessingId = null;
-                    this.batchA = [];
-                    this.holdTimerEnd = 0;
-                    
-                    // Transition to Batch B if it exists
-                    if (this.batchB.length > 0) {
-                        this.batchA = [...this.batchB];
-                        this.batchB = [];
-                        this.timerEndA = this.timerEndB; // Carry over timer
-                        this.state = 'BATCH_A_WAIT';
-                    } else {
-                        this.state = 'IDLE';
-                    }
-                    await this.saveState();
-                    break;
+                        // Transition to Batch B if it exists
+                        if (this.batchB.length > 0) {
+                            this.batchA = [...this.batchB];
+                            this.batchB = [];
+                            this.timerEndA = this.timerEndB; // Carry over timer
+                            this.state = 'BATCH_A_WAIT';
+                        } else {
+                            this.state = 'IDLE';
+                        }
+                        await this.saveState();
+                        break;
+                }
+            } catch (err) {
+                console.error("[Houston] Engine loop encountered a non-fatal error. Recovering...", err);
+                await sleep(1000); // Backoff to prevent infinite error spamming
             }
         }
     }
