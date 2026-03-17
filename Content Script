@@ -221,8 +221,26 @@ class ExtJSAPI {
 class HoustonHUD {
     constructor() {
         this.container = document.createElement('div');
+        this.container.id = "houston-host-container";
+        
+        // Inline styles applied directly to the host container
+        // This makes it completely immune to the page's structure and isolates drag logic
+        this.container.style.cssText = `
+            all: initial;
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 2147483647;
+            width: 320px;
+            height: 420px; /* Fixed physical size so it never grows out of bounds */
+            pointer-events: none; /* Allows clicks to pass through if empty, handled in CSS */
+        `;
+
         this.shadow = this.container.attachShadow({ mode: 'open' });
-        document.body.appendChild(this.container);
+        
+        // Append to HTML instead of body to bypass ExtJS body styling rules
+        document.documentElement.appendChild(this.container);
+        
         this.initUI();
         this.loadCSS();
         this.makeDraggable();
@@ -362,33 +380,46 @@ class HoustonHUD {
     }
 
     makeDraggable() {
-        const hud = this.shadow.getElementById('houston-hud');
         const header = this.shadow.querySelector('.hud-header');
-        let isDragging = false, currentX, currentY, initialX, initialY, xOffset = 0, yOffset = 0;
+        const hud = this.shadow.getElementById('houston-hud');
+        let isDragging = false;
+        let startX, startY, initialLeft, initialTop;
 
         header.addEventListener('pointerdown', (e) => {
-            initialX = e.clientX - xOffset;
-            initialY = e.clientY - yOffset;
             isDragging = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            
+            // Get the current actual position of the host container
+            const rect = this.container.getBoundingClientRect();
+            initialLeft = rect.left;
+            initialTop = rect.top;
+
+            // Remove right/bottom constraints to strictly rely on left/top for absolute movement
+            this.container.style.right = 'auto';
+            this.container.style.bottom = 'auto';
+            this.container.style.left = `${initialLeft}px`;
+            this.container.style.top = `${initialTop}px`;
+
             header.classList.add('dragging');
             hud.classList.add('dragging');
+            
             try { header.setPointerCapture(e.pointerId); } catch(err) {}
         });
 
         header.addEventListener('pointermove', (e) => {
-            if (isDragging) {
-                e.preventDefault();
-                currentX = e.clientX - initialX;
-                currentY = e.clientY - initialY;
-                xOffset = currentX;
-                yOffset = currentY;
-                hud.style.transform = `translate3d(${currentX}px, ${currentY}px, 0)`;
-            }
+            if (!isDragging) return;
+            e.preventDefault();
+            
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+            
+            // Move the actual container injected into the document root
+            this.container.style.left = `${initialLeft + dx}px`;
+            this.container.style.top = `${initialTop + dy}px`;
         });
 
         header.addEventListener('pointerup', (e) => {
-            initialX = currentX;
-            initialY = currentY;
             isDragging = false;
             header.classList.remove('dragging');
             hud.classList.remove('dragging');
