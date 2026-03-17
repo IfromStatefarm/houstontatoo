@@ -1,5 +1,5 @@
 /**
- * Houston Auto-Tattoo ExtJS Automation Engine
+ * Houston Auto-Tattoo ExtJS Automation Engine - Optimized
  * Uses Shadow DOM for HUD, Mutex for modal locking, and advanced timing logic.
  */
 
@@ -35,13 +35,18 @@ const extJsMutex = new Mutex();
 // EXTJS DOM INTERACTION LAYER
 // ==========================================
 class ExtJSAPI {
-    static isUserModalOpen() {
+    static isUserModalOpen(activeId) {
         // Refined modal detection using computed styles for opacity and visibility
-        const windows = document.querySelectorAll('.x-window');
+        const windows = document.querySelectorAll('.x-window:not([style*="display: none"])');
         for (let i = 0; i < windows.length; i++) {
-            const style = window.getComputedStyle(windows[i]);
-            if (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0') {
-                return true;
+            const win = windows[i];
+            const style = window.getComputedStyle(win);
+            if (style.visibility !== 'hidden' && style.opacity !== '0') {
+                const title = win.innerText || "";
+                // If there's a modal open that doesn't look like our target's edit window, it's a user modal
+                if (!title.includes("Edit") && !win.classList.contains('x-menu')) {
+                    return true;
+                }
             }
         }
         return false;
@@ -50,7 +55,7 @@ class ExtJSAPI {
     static async waitForMaskClear(timeoutMs = 15000) {
         const start = Date.now();
         while (Date.now() - start < timeoutMs) {
-            const mask = document.querySelector('.x-mask:not([style*="display: none"])');
+            const mask = document.querySelector('.x-mask:not([style*="display: none"]), .x-mask-loading');
             if (!mask) return true;
             await sleep(250);
         }
@@ -109,7 +114,10 @@ class ExtJSAPI {
 
             const start = Date.now();
             while (Date.now() - start < 4000) {
-                if (this.isUserModalOpen()) return true;
+                // Check specifically if an automation/edit window popped up
+                if (document.querySelector('.x-window:not([style*="display: none"])')) {
+                    return true;
+                }
                 await sleep(200);
             }
             console.warn(`[Houston] Gear click attempt ${attempt} failed for ID ${recordId}. Retrying...`);
@@ -126,10 +134,10 @@ class ExtJSAPI {
         const fieldWrapper = textSpan.closest('.x-checkboxfield');
         if (!fieldWrapper) return false;
 
-        const isCurrentlyON = fieldWrapper.classList.contains('x-checked');
+        const isCurrentlyON = fieldWrapper.classList.contains('x-checked') || fieldWrapper.querySelector('.x-checked') !== null;
 
         if (isCurrentlyON !== targetStateON) {
-            const clickTarget = fieldWrapper.querySelector('.x-input-el, .x-icon-el');
+            const clickTarget = fieldWrapper.querySelector('.x-input-el, .x-icon-el') || fieldWrapper;
             if (clickTarget) {
                 clickTarget.click();
                 await sleep(400);
@@ -143,23 +151,20 @@ class ExtJSAPI {
         
         if (saveBtn) {
             saveBtn.click();
-            const maskCleared = await this.waitForMaskClear(10000);
-            if (!maskCleared) {
-                this.forceClose();
-                await sleep(1000);
-            }
         } else {
-            const saveXPath = "//div[contains(@class, 'x-window')]//div[contains(@class, 'x-text-el') and (text()='Save' or text()='Submit')]";
+            const saveXPath = "//div[contains(@class, 'x-window')]//span[text()='Save' or text()='Submit']";
             const saveText = document.evaluate(saveXPath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
             if (saveText) {
                 saveText.click();
-                await this.waitForMaskClear(10000);
             } else {
                 this.forceClose();
+                return;
             }
         }
         
+        await this.waitForMaskClear(10000);
         await sleep(500);
+        
         if (this.isUserModalOpen()) {
             this.forceClose();
         }
@@ -333,15 +338,16 @@ class HoustonEngine {
         this.state = 'IDLE'; 
         this.batchA = [];
         this.batchB = [];
-        this.batchBTimerEnd = 0;
-        this.timerEnd = 0;
+        
+        // Fixed separate timers from optimized script
+        this.timerEndA = 0;
+        this.timerEndB = 0;
+        this.holdTimerEnd = 0;
         
         this.processedHistory = new Set();
-        this.pendingSet = new Set(); // Double-entry protection
-        
         this.skipCurrent = false;
         this.stopped = false;
-        this.currentProcessingId = null; // Track UI state
+        this.currentProcessingId = null;
 
         this.loadState().then(() => {
             this.initObserver();
@@ -355,12 +361,12 @@ class HoustonEngine {
         if (data.houstonState) {
             const s = data.houstonState;
             this.processedHistory = new Set(s.history || []);
-            this.pendingSet = new Set(s.pending || []);
             this.batchA = s.batchA || [];
             this.batchB = s.batchB || [];
             this.state = s.state || 'IDLE';
-            this.timerEnd = s.timerEnd || 0;
-            this.batchBTimerEnd = s.batchBTimerEnd || 0;
+            this.timerEndA = s.timerEndA || 0;
+            this.timerEndB = s.timerEndB || 0;
+            this.holdTimerEnd = s.holdTimerEnd || 0;
             console.log("[Houston] State restored from storage", this.state);
         }
     }
@@ -369,12 +375,12 @@ class HoustonEngine {
         await chrome.storage.local.set({
             houstonState: { 
                 history: Array.from(this.processedHistory),
-                pending: Array.from(this.pendingSet),
                 batchA: this.batchA,
                 batchB: this.batchB,
                 state: this.state,
-                timerEnd: this.timerEnd,
-                batchBTimerEnd: this.batchBTimerEnd
+                timerEndA: this.timerEndA,
+                timerEndB: this.timerEndB,
+                holdTimerEnd: this.holdTimerEnd
             }
         });
     }
@@ -388,39 +394,15 @@ class HoustonEngine {
 
     async purgeMemory() {
         this.processedHistory.clear();
-        this.pendingSet.clear();
         this.batchA = [];
         this.batchB = [];
         this.state = 'IDLE';
-        this.timerEnd = 0;
-        this.batchBTimerEnd = 0;
+        this.timerEndA = 0;
+        this.timerEndB = 0;
+        this.holdTimerEnd = 0;
         this.currentProcessingId = null;
         await this.saveState();
         this.hud.updateQueue([], []);
-    }
-
-    // ==========================================
-    // AUTO-SCROLL SCANNER
-    // ==========================================
-    async startAutoScanLoop() {
-        let direction = 1; 
-        while (!this.stopped) {
-            if (this.state === 'IDLE' || this.state === 'BATCH_A_WAIT' || this.state === 'HOLD_30') {
-                const scroller = ExtJSAPI.getGridScroller();
-                if (scroller) {
-                    this.hud.setScanning(true);
-                    scroller.scrollBy(0, 300 * direction);
-                    if (direction === 1 && (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 10)) {
-                        direction = -1;
-                    } else if (direction === -1 && scroller.scrollTop <= 10) {
-                        direction = 1;
-                    }
-                    await sleep(3000); 
-                    this.hud.setScanning(false);
-                }
-            }
-            await sleep(2000);
-        }
     }
 
     initObserver() {
@@ -435,9 +417,8 @@ class HoustonEngine {
                     const row = cell.closest('.x-gridrow');
                     if (row) {
                         const recordId = row.getAttribute('data-recordid');
-                        // Added Pending Set check to prevent double-entry from excessive mutations
-                        if (recordId && !this.processedHistory.has(recordId) && !this.pendingSet.has(recordId)) {
-                            await this.handleLiveEventDetected(recordId);
+                        if (recordId && !this.processedHistory.has(recordId) && !this.batchA.includes(recordId) && !this.batchB.includes(recordId)) {
+                            this.handleNewLiveEvent(recordId);
                         }
                     }
                 }
@@ -446,35 +427,34 @@ class HoustonEngine {
         this.observer.observe(document.body, config);
     }
 
-    async handleLiveEventDetected(recordId) {
-        this.pendingSet.add(recordId); // Lock the ID locally immediately
-
+    handleNewLiveEvent(id) {
+        // Logic for Simultaneous Batches
         if (this.state === 'IDLE') {
-            this.batchA.push(recordId);
-            this.transitionTo('BATCH_A_WAIT', 15);
-        } else if (this.state === 'BATCH_A_WAIT' || this.state === 'PROCESS_A_ON') {
-            this.batchA.push(recordId);
-        } else if (this.state === 'HOLD_30') {
-            this.batchA.push(recordId);
-            this.hud.updateQueue(this.batchA, this.batchB, this.currentProcessingId);
-            // Wait out the currently running flow, then inject it directly
-            await this.executeAction(recordId, true);
-        } else if (this.state === 'PROCESS_A_OFF') {
-            this.batchB.push(recordId);
-            if (this.batchBTimerEnd === 0) {
-                this.batchBTimerEnd = Date.now() + 15000;
-            }
+            this.batchA.push(id);
+            this.state = 'BATCH_A_WAIT';
+            this.timerEndA = Date.now() + 15000;
+        } 
+        else if (this.state === 'BATCH_A_WAIT' || this.state === 'PROCESS_A_ON') {
+            this.batchA.push(id);
         }
-        await this.saveState();
-        this.hud.updateQueue(this.batchA, this.batchB, this.currentProcessingId);
+        else if (this.state === 'HOLD_30') {
+            // Phase 3: Late arrival during hold - Inject into A and process immediately
+            this.batchA.push(id);
+            this.processSingleImmediate(id, true);
+        }
+        else if (this.state === 'PROCESS_A_OFF') {
+            // Phase 5: A is cleaning up, start Batch B timer
+            if (this.batchB.length === 0) {
+                this.timerEndB = Date.now() + 15000;
+            }
+            this.batchB.push(id);
+        }
+        this.saveState();
     }
 
-    transitionTo(newState, seconds) {
-        this.state = newState;
-        if (seconds) {
-            this.timerEnd = Date.now() + (seconds * 1000);
-        }
-        this.saveState(); // Persist transition phase
+    async processSingleImmediate(id, targetOn) {
+        // Runs alongside the main loop but respects the mutex queue
+        await this.executeAction(id, targetOn);
     }
 
     updateHUD() {
@@ -487,7 +467,7 @@ class HoustonEngine {
 
         if (this.state === 'BATCH_A_WAIT') {
             label = 'BATCHING (15s)';
-            remain = (this.timerEnd - Date.now()) / 1000;
+            remain = (this.timerEndA - Date.now()) / 1000;
             status = 'WAITING'; color = 'waiting';
         } else if (this.state === 'PROCESS_A_ON') {
             label = 'TATTOO ON';
@@ -495,7 +475,7 @@ class HoustonEngine {
             status = 'PROCESSING'; color = 'processing';
         } else if (this.state === 'HOLD_30') {
             label = 'HOLD TIMER (30s)';
-            remain = (this.timerEnd - Date.now()) / 1000;
+            remain = (this.holdTimerEnd - Date.now()) / 1000;
             status = 'HOLDING'; color = 'waiting';
         } else if (this.state === 'PROCESS_A_OFF') {
             label = 'TATTOO OFF';
@@ -513,58 +493,66 @@ class HoustonEngine {
             await sleep(500);
             this.updateHUD();
 
-            // Modal Check is secure since the Engine loop rests while actual executing is happening
-            if (ExtJSAPI.isUserModalOpen() && (this.state === 'PROCESS_A_ON' || this.state === 'PROCESS_A_OFF')) {
+            if (ExtJSAPI.isUserModalOpen(this.currentProcessingId)) {
                 this.hud.updateStatus('PAUSED (User Modal)', 'waiting');
                 continue;
             }
 
-            if (this.state === 'BATCH_A_WAIT') {
-                if (Date.now() >= this.timerEnd) {
-                    this.transitionTo('PROCESS_A_ON', 0);
-                }
-            } 
-            else if (this.state === 'PROCESS_A_ON') {
-                for (let id of [...this.batchA]) {
-                    if (this.skipCurrent) { this.skipCurrent = false; continue; }
-                    this.currentProcessingId = id;
-                    this.updateHUD();
-                    
-                    await this.executeAction(id, true);
-                    
-                    this.currentProcessingId = null;
-                }
-                this.transitionTo('HOLD_30', 30);
-            } 
-            else if (this.state === 'HOLD_30') {
-                if (Date.now() >= this.timerEnd) {
-                    this.transitionTo('PROCESS_A_OFF', 0);
-                }
-            } 
-            else if (this.state === 'PROCESS_A_OFF') {
-                for (let id of [...this.batchA]) {
-                    if (this.skipCurrent) { this.skipCurrent = false; continue; }
-                    this.currentProcessingId = id;
-                    this.updateHUD();
-                    
-                    await this.executeAction(id, false);
-                    this.processedHistory.add(id);
-                    this.currentProcessingId = null;
-                }
-                
-                this.batchA = [];
-                await this.saveState();
+            switch (this.state) {
+                case 'BATCH_A_WAIT':
+                    if (Date.now() >= this.timerEndA) {
+                        this.state = 'PROCESS_A_ON';
+                        this.saveState();
+                    }
+                    break;
 
-                if (this.batchB.length > 0) {
-                    this.batchA = [...this.batchB];
-                    this.batchB = [];
-                    const remaining = Math.max(0, (this.batchBTimerEnd - Date.now()) / 1000);
-                    this.transitionTo('BATCH_A_WAIT', remaining);
-                    this.batchBTimerEnd = 0;
+                case 'PROCESS_A_ON':
+                    for (let id of [...this.batchA]) {
+                        if (this.skipCurrent) { this.skipCurrent = false; continue; }
+                        this.currentProcessingId = id;
+                        this.updateHUD();
+                        
+                        await this.executeAction(id, true);
+                        
+                        // Start the 30s hold after the first successful action
+                        if (this.holdTimerEnd === 0) this.holdTimerEnd = Date.now() + 30000;
+                    }
+                    this.currentProcessingId = null;
+                    this.state = 'HOLD_30';
+                    this.saveState();
+                    break;
+
+                case 'HOLD_30':
+                    if (Date.now() >= this.holdTimerEnd) {
+                        this.state = 'PROCESS_A_OFF';
+                        this.saveState();
+                    }
+                    break;
+
+                case 'PROCESS_A_OFF':
+                    for (let id of [...this.batchA]) {
+                        if (this.skipCurrent) { this.skipCurrent = false; continue; }
+                        this.currentProcessingId = id;
+                        this.updateHUD();
+                        
+                        await this.executeAction(id, false);
+                        this.processedHistory.add(id);
+                    }
+                    this.currentProcessingId = null;
+                    this.batchA = [];
+                    this.holdTimerEnd = 0;
+                    
+                    // Transition to Batch B if it exists
+                    if (this.batchB.length > 0) {
+                        this.batchA = [...this.batchB];
+                        this.batchB = [];
+                        this.timerEndA = this.timerEndB; // Carry over timer
+                        this.state = 'BATCH_A_WAIT';
+                    } else {
+                        this.state = 'IDLE';
+                    }
                     await this.saveState();
-                } else {
-                    this.transitionTo('IDLE', 0);
-                }
+                    break;
             }
         }
     }
@@ -586,6 +574,27 @@ class HoustonEngine {
             ExtJSAPI.forceClose();
         } finally {
             extJsMutex.release();
+        }
+    }
+
+    async startAutoScanLoop() {
+        let direction = 1; 
+        while (!this.stopped) {
+            if (this.state === 'IDLE' || this.state === 'BATCH_A_WAIT' || this.state === 'HOLD_30') {
+                const scroller = ExtJSAPI.getGridScroller();
+                if (scroller) {
+                    this.hud.setScanning(true);
+                    scroller.scrollBy(0, 300 * direction);
+                    if (direction === 1 && (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 10)) {
+                        direction = -1;
+                    } else if (direction === -1 && scroller.scrollTop <= 10) {
+                        direction = 1;
+                    }
+                    await sleep(3000); 
+                    this.hud.setScanning(false);
+                }
+            }
+            await sleep(2000);
         }
     }
 }
