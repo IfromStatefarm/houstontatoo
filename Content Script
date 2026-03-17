@@ -1,6 +1,6 @@
 /**
- * Houston Auto-Tattoo ExtJS Automation Engine - Optimized
- * Uses Shadow DOM for HUD, Mutex for modal locking, and advanced timing logic.
+ * Houston Auto-Tattoo ExtJS Automation Engine - Optimized & Multi-Tab Safe
+ * Uses Leader Election, Shadow DOM for HUD, Mutex for modal locking, and advanced timing logic.
  */
 
 // ==========================================
@@ -32,18 +32,65 @@ class Mutex {
 const extJsMutex = new Mutex();
 
 // ==========================================
+// MULTI-TAB LEADER ELECTION
+// ==========================================
+class LeaderElection {
+    constructor(onStateChange) {
+        this.instanceId = crypto.randomUUID();
+        this.isLeader = false;
+        this.onStateChange = onStateChange;
+        this.heartbeatInterval = 2000; // Ping every 2 seconds
+        this.leaderTimeout = 6000;     // Consider leader dead after 6 seconds of silence
+        this.start();
+    }
+
+    async start() {
+        await this.checkLeader();
+        setInterval(() => this.checkLeader(), this.heartbeatInterval);
+    }
+
+    async checkLeader() {
+        const data = await chrome.storage.local.get(['houstonLeader']);
+        const now = Date.now();
+        let leaderInfo = data.houstonLeader || {};
+
+        // If no leader, or leader's heartbeat is too old, claim leadership
+        if (!leaderInfo.id || (now - leaderInfo.heartbeat > this.leaderTimeout)) {
+            leaderInfo = { id: this.instanceId, heartbeat: now };
+            await chrome.storage.local.set({ houstonLeader: leaderInfo });
+            
+            if (!this.isLeader) {
+                this.isLeader = true;
+                this.onStateChange(true);
+            }
+        } 
+        // If we are already the leader, update the heartbeat
+        else if (leaderInfo.id === this.instanceId) {
+            leaderInfo.heartbeat = now;
+            await chrome.storage.local.set({ houstonLeader: leaderInfo });
+        } 
+        // Someone else is the active leader
+        else {
+            if (this.isLeader) {
+                this.isLeader = false;
+                this.onStateChange(false);
+            }
+        }
+    }
+}
+
+
+// ==========================================
 // EXTJS DOM INTERACTION LAYER
 // ==========================================
 class ExtJSAPI {
     static isUserModalOpen(activeId) {
-        // Refined modal detection using computed styles for opacity and visibility
         const windows = document.querySelectorAll('.x-window:not([style*="display: none"])');
         for (let i = 0; i < windows.length; i++) {
             const win = windows[i];
             const style = window.getComputedStyle(win);
             if (style.visibility !== 'hidden' && style.opacity !== '0') {
                 const title = win.innerText || "";
-                // If there's a modal open that doesn't look like our target's edit window, it's a user modal
                 if (!title.includes("Edit") && !win.classList.contains('x-menu')) {
                     return true;
                 }
@@ -92,12 +139,10 @@ class ExtJSAPI {
         row.scrollIntoView({ behavior: 'smooth', block: 'center' });
         await sleep(300);
 
-        // Resilient Gear Click logic - 2 attempts to account for ExtJS render lag
         for (let attempt = 1; attempt <= 2; attempt++) {
             const gearIcon = row.querySelector('.fa-cog, .x-action-col-icon, [data-qtip*="Edit"]');
             if (!gearIcon) return false;
             
-            // Dispatch mousedown before click to ensure ExtJS registers the interaction
             gearIcon.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
             gearIcon.click();
             
@@ -114,7 +159,6 @@ class ExtJSAPI {
 
             const start = Date.now();
             while (Date.now() - start < 4000) {
-                // Check specifically if an automation/edit window popped up
                 if (document.querySelector('.x-window:not([style*="display: none"])')) {
                     return true;
                 }
@@ -202,10 +246,13 @@ class HoustonHUD {
         wrapper.id = 'houston-hud';
         wrapper.innerHTML = `
             <div class="hud-header">
-                <span>Houston Auto-Tattoo</span>
+                <div class="title-area">
+                    <span>Houston Auto-Tattoo</span>
+                    <span id="role-badge" class="role-badge role-standby">INIT</span>
+                </div>
                 <div class="status-indicator">
-                    <span class="dot idle" id="status-dot"></span>
-                    <span id="status-text">Idle</span>
+                    <span class="dot standby" id="status-dot"></span>
+                    <span id="status-text">Booting</span>
                 </div>
             </div>
             <div class="hud-body">
@@ -233,10 +280,32 @@ class HoustonHUD {
             const stopBtn = this.shadow.getElementById('btn-stop');
             const skipBtn = this.shadow.getElementById('btn-skip');
             const purgeBtn = this.shadow.getElementById('btn-purge');
+            
             if(stopBtn) stopBtn.addEventListener('click', () => engine.emergencyStop());
-            if(skipBtn) skipBtn.addEventListener('click', () => engine.skipCurrent = true);
-            if(purgeBtn) purgeBtn.addEventListener('click', () => engine.purgeMemory());
+            if(skipBtn) skipBtn.addEventListener('click', () => { if(engine.isLeader) engine.skipCurrent = true; });
+            if(purgeBtn) purgeBtn.addEventListener('click', () => { if(engine.isLeader) engine.purgeMemory(); });
         }, 500);
+    }
+
+    setRole(isLeader) {
+        const badge = this.shadow.getElementById('role-badge');
+        if (!badge) return;
+        if (isLeader) {
+            badge.innerText = 'LEADER';
+            badge.className = 'role-badge role-leader';
+            this.toggleButtons(false);
+        } else {
+            badge.innerText = 'STANDBY';
+            badge.className = 'role-badge role-standby';
+            this.toggleButtons(true);
+        }
+    }
+
+    toggleButtons(disabled) {
+        ['btn-stop', 'btn-skip', 'btn-purge'].forEach(id => {
+            const btn = this.shadow.getElementById(id);
+            if(btn) btn.disabled = disabled;
+        });
     }
 
     updateStatus(statusStr, colorClass) {
@@ -281,7 +350,6 @@ class HoustonHUD {
         allItems.forEach(item => {
             const li = document.createElement('li');
             const isActive = item.id === activeId;
-            // Enhanced visual feedback for Active vs Pending
             if (isActive) {
                 li.classList.add('status-active');
                 li.innerHTML = `<span>[${item.b}] ID: ${item.id}</span> <span class="badge active-badge">ACTIVE</span>`;
@@ -303,7 +371,7 @@ class HoustonHUD {
             initialY = e.clientY - yOffset;
             isDragging = true;
             header.classList.add('dragging');
-            hud.classList.add('dragging'); // Applies user-select: none
+            hud.classList.add('dragging');
             try { header.setPointerCapture(e.pointerId); } catch(err) {}
         });
 
@@ -335,11 +403,12 @@ class HoustonHUD {
 class HoustonEngine {
     constructor() {
         this.hud = new HoustonHUD();
+        this.isLeader = false;
+        
         this.state = 'IDLE'; 
         this.batchA = [];
         this.batchB = [];
         
-        // Fixed separate timers from optimized script
         this.timerEndA = 0;
         this.timerEndB = 0;
         this.holdTimerEnd = 0;
@@ -349,6 +418,20 @@ class HoustonEngine {
         this.stopped = false;
         this.currentProcessingId = null;
 
+        // Initialize Leader Election
+        this.leaderElection = new LeaderElection((isLeader) => {
+            this.isLeader = isLeader;
+            this.hud.setRole(isLeader);
+            if (isLeader) {
+                console.log("[Houston] Promoted to LEADER tab.");
+            } else {
+                console.log("[Houston] Demoted to STANDBY tab.");
+            }
+            this.updateHUD(); // Refresh HUD to reflect role change status
+        });
+
+        this.initStorageListener();
+
         this.loadState().then(() => {
             this.initObserver();
             this.startEngineLoop();
@@ -356,22 +439,38 @@ class HoustonEngine {
         });
     }
 
+    initStorageListener() {
+        // Listen to changes made by the LEADER so STANDBY tabs stay visually synced
+        chrome.storage.onChanged.addListener((changes, area) => {
+            if (area === 'local' && changes.houstonState && !this.isLeader) {
+                this.syncStateFromStorage(changes.houstonState.newValue);
+            }
+        });
+    }
+
+    syncStateFromStorage(s) {
+        if (!s) return;
+        this.processedHistory = new Set(s.history || []);
+        this.batchA = s.batchA || [];
+        this.batchB = s.batchB || [];
+        this.state = s.state || 'IDLE';
+        this.timerEndA = s.timerEndA || 0;
+        this.timerEndB = s.timerEndB || 0;
+        this.holdTimerEnd = s.holdTimerEnd || 0;
+        this.currentProcessingId = s.currentProcessingId || null;
+        this.updateHUD();
+    }
+
     async loadState() {
         const data = await chrome.storage.local.get(['houstonState']);
         if (data.houstonState) {
-            const s = data.houstonState;
-            this.processedHistory = new Set(s.history || []);
-            this.batchA = s.batchA || [];
-            this.batchB = s.batchB || [];
-            this.state = s.state || 'IDLE';
-            this.timerEndA = s.timerEndA || 0;
-            this.timerEndB = s.timerEndB || 0;
-            this.holdTimerEnd = s.holdTimerEnd || 0;
-            console.log("[Houston] State restored from storage", this.state);
+            this.syncStateFromStorage(data.houstonState);
         }
     }
 
     async saveState() {
+        if (!this.isLeader) return; // Only leaders write to state
+        
         await chrome.storage.local.set({
             houstonState: { 
                 history: Array.from(this.processedHistory),
@@ -380,12 +479,14 @@ class HoustonEngine {
                 state: this.state,
                 timerEndA: this.timerEndA,
                 timerEndB: this.timerEndB,
-                holdTimerEnd: this.holdTimerEnd
+                holdTimerEnd: this.holdTimerEnd,
+                currentProcessingId: this.currentProcessingId // Saves active ID so followers see it
             }
         });
     }
 
     emergencyStop() {
+        if (!this.isLeader) return;
         this.stopped = true;
         this.hud.updateStatus('STOPPED', 'idle');
         this.hud.updateTimer('SYSTEM HALTED', -1);
@@ -393,6 +494,7 @@ class HoustonEngine {
     }
 
     async purgeMemory() {
+        if (!this.isLeader) return;
         this.processedHistory.clear();
         this.batchA = [];
         this.batchB = [];
@@ -407,17 +509,16 @@ class HoustonEngine {
 
     initObserver() {
         const config = { childList: true, subtree: true, characterData: true };
-        let throttleTimeout = null; // Used to prevent the browser tab from freezing
+        let throttleTimeout = null; 
 
         this.observer = new MutationObserver((mutations) => {
-            if (this.stopped) return;
+            if (this.stopped || !this.isLeader) return; // Only leader observes DOM
             
-            // Throttle ExtJS DOM scanning to run at most once per 500ms
             if (throttleTimeout) return;
             
             throttleTimeout = setTimeout(() => {
                 throttleTimeout = null;
-                if (this.stopped) return;
+                if (this.stopped || !this.isLeader) return;
 
                 const cells = document.querySelectorAll('.x-grid-cell-inner, .x-gridcell-body-el');
                 for (let cell of cells) {
@@ -439,7 +540,6 @@ class HoustonEngine {
     }
 
     handleNewLiveEvent(id) {
-        // Logic for Simultaneous Batches
         if (this.state === 'IDLE') {
             this.batchA.push(id);
             this.state = 'BATCH_A_WAIT';
@@ -449,12 +549,10 @@ class HoustonEngine {
             this.batchA.push(id);
         }
         else if (this.state === 'HOLD_30') {
-            // Phase 3: Late arrival during hold - Inject into A and process immediately
             this.batchA.push(id);
             this.processSingleImmediate(id, true);
         }
         else if (this.state === 'PROCESS_A_OFF') {
-            // Phase 5: A is cleaning up, start Batch B timer
             if (this.batchB.length === 0) {
                 this.timerEndB = Date.now() + 15000;
             }
@@ -464,7 +562,6 @@ class HoustonEngine {
     }
 
     async processSingleImmediate(id, targetOn) {
-        // Runs alongside the main loop but respects the mutex queue
         await this.executeAction(id, targetOn);
     }
 
@@ -476,22 +573,27 @@ class HoustonEngine {
         let status = 'IDLE';
         let color = 'idle';
 
+        if (!this.isLeader) {
+            status = 'STANDBY (Syncing)';
+            color = 'standby';
+        }
+
         if (this.state === 'BATCH_A_WAIT') {
             label = 'BATCHING (15s)';
             remain = (this.timerEndA - Date.now()) / 1000;
-            status = 'WAITING'; color = 'waiting';
+            if (this.isLeader) { status = 'WAITING'; color = 'waiting'; }
         } else if (this.state === 'PROCESS_A_ON') {
             label = 'TATTOO ON';
             remain = -1;
-            status = 'PROCESSING'; color = 'processing';
+            if (this.isLeader) { status = 'PROCESSING'; color = 'processing'; }
         } else if (this.state === 'HOLD_30') {
             label = 'HOLD TIMER (30s)';
             remain = (this.holdTimerEnd - Date.now()) / 1000;
-            status = 'HOLDING'; color = 'waiting';
+            if (this.isLeader) { status = 'HOLDING'; color = 'waiting'; }
         } else if (this.state === 'PROCESS_A_OFF') {
             label = 'TATTOO OFF';
             remain = -1;
-            status = 'CLEANING UP'; color = 'processing';
+            if (this.isLeader) { status = 'CLEANING UP'; color = 'processing'; }
         }
 
         this.hud.updateTimer(label, remain);
@@ -506,6 +608,8 @@ class HoustonEngine {
             try {
                 this.updateHUD();
 
+                if (!this.isLeader) continue; // Standby tabs just chill and update HUD via storage
+
                 if (ExtJSAPI.isUserModalOpen(this.currentProcessingId)) {
                     this.hud.updateStatus('PAUSED (User Modal)', 'waiting');
                     continue;
@@ -515,61 +619,71 @@ class HoustonEngine {
                     case 'BATCH_A_WAIT':
                         if (Date.now() >= this.timerEndA) {
                             this.state = 'PROCESS_A_ON';
-                            this.saveState();
+                            await this.saveState();
                         }
                         break;
 
                     case 'PROCESS_A_ON':
                         for (let id of [...this.batchA]) {
+                            if (!this.isLeader) break; // Break out if demoted mid-loop
                             if (this.skipCurrent) { this.skipCurrent = false; continue; }
+                            
                             this.currentProcessingId = id;
+                            await this.saveState(); // Save state so followers see the active item
                             this.updateHUD();
                             
                             await this.executeAction(id, true);
                             
-                            // Start the 30s hold after the first successful action
                             if (this.holdTimerEnd === 0) this.holdTimerEnd = Date.now() + 30000;
                         }
-                        this.currentProcessingId = null;
-                        this.state = 'HOLD_30';
-                        this.saveState();
+                        
+                        if (this.isLeader) {
+                            this.currentProcessingId = null;
+                            this.state = 'HOLD_30';
+                            await this.saveState();
+                        }
                         break;
 
                     case 'HOLD_30':
                         if (Date.now() >= this.holdTimerEnd) {
                             this.state = 'PROCESS_A_OFF';
-                            this.saveState();
+                            await this.saveState();
                         }
                         break;
 
                     case 'PROCESS_A_OFF':
                         for (let id of [...this.batchA]) {
+                            if (!this.isLeader) break; // Break out if demoted
                             if (this.skipCurrent) { this.skipCurrent = false; continue; }
+                            
                             this.currentProcessingId = id;
+                            await this.saveState();
                             this.updateHUD();
                             
                             await this.executeAction(id, false);
                             this.processedHistory.add(id);
                         }
-                        this.currentProcessingId = null;
-                        this.batchA = [];
-                        this.holdTimerEnd = 0;
                         
-                        // Transition to Batch B if it exists
-                        if (this.batchB.length > 0) {
-                            this.batchA = [...this.batchB];
-                            this.batchB = [];
-                            this.timerEndA = this.timerEndB; // Carry over timer
-                            this.state = 'BATCH_A_WAIT';
-                        } else {
-                            this.state = 'IDLE';
+                        if (this.isLeader) {
+                            this.currentProcessingId = null;
+                            this.batchA = [];
+                            this.holdTimerEnd = 0;
+                            
+                            if (this.batchB.length > 0) {
+                                this.batchA = [...this.batchB];
+                                this.batchB = [];
+                                this.timerEndA = this.timerEndB; 
+                                this.state = 'BATCH_A_WAIT';
+                            } else {
+                                this.state = 'IDLE';
+                            }
+                            await this.saveState();
                         }
-                        await this.saveState();
                         break;
                 }
             } catch (err) {
                 console.error("[Houston] Engine loop encountered a non-fatal error. Recovering...", err);
-                await sleep(1000); // Backoff to prevent infinite error spamming
+                await sleep(1000); 
             }
         }
     }
@@ -597,7 +711,7 @@ class HoustonEngine {
     async startAutoScanLoop() {
         let direction = 1; 
         while (!this.stopped) {
-            if (this.state === 'IDLE' || this.state === 'BATCH_A_WAIT' || this.state === 'HOLD_30') {
+            if (this.isLeader && (this.state === 'IDLE' || this.state === 'BATCH_A_WAIT' || this.state === 'HOLD_30')) {
                 const scroller = ExtJSAPI.getGridScroller();
                 if (scroller) {
                     this.hud.setScanning(true);
