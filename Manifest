@@ -7,7 +7,7 @@
     "storage"
   ],
   "host_permissions": [
-    "<houston.flosports.net/#dashboard/events/list//>"
+    "<all_urls>"
   ],
   "content_scripts": [
     {
@@ -22,4 +22,3 @@
       "matches": ["<all_urls>"]
     }
   ]
-}
