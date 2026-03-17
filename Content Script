@@ -1,0 +1,314 @@
+/**
+ * Houston Auto-Tattoo ExtJS Automation Engine
+ * Uses Shadow DOM for HUD, Mutex for modal locking, and advanced timing logic.
+ */
+
+// ==========================================
+// UTILITIES & LOCKING
+// ==========================================
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+class Mutex {
+    constructor() {
+        this._locked = false;
+        this._queue = [];
+    }
+    async acquire() {
+        if (!this._locked) {
+            this._locked = true;
+            return;
+        }
+        return new Promise(resolve => this._queue.push(resolve));
+    }
+    release() {
+        if (this._queue.length > 0) {
+            const nextResolve = this._queue.shift();
+            nextResolve();
+        } else {
+            this._locked = false;
+        }
+    }
+}
+const extJsMutex = new Mutex();
+
+// ==========================================
+// EXTJS DOM INTERACTION LAYER
+// ==========================================
+class ExtJSAPI {
+    static isUserModalOpen() {
+        // Check if an ExtJS window is open that wasn't opened by our bot
+        const openWindow = document.querySelector('.x-window:not([style*="display: none"])');
+        return openWindow !== null;
+    }
+
+    static async waitForMaskClear(timeoutMs = 15000) {
+        const start = Date.now();
+        while (Date.now() - start < timeoutMs) {
+            const mask = document.querySelector('.x-mask:not([style*="display: none"])');
+            if (!mask) return true; // Mask cleared
+            await sleep(250);
+        }
+        return false; // Timed out
+    }
+
+    static async clickGearAndEdit(recordId) {
+        // Virtual scroll logic: ensure row is in DOM and view
+        let row = document.querySelector(`.x-gridrow[data-recordid="${recordId}"]`);
+        if (!row) {
+            console.warn(`[Houston] Row ${recordId} not in DOM. Attempting to scroll grid...`);
+            // ExtJS virtual scrolling workaround: Try to scroll the main grid body slightly to force render
+            const gridBody = document.querySelector('.x-grid-item-container') || document.body;
+            gridBody.scrollBy(0, 100);
+            await sleep(500);
+            row = document.querySelector(`.x-gridrow[data-recordid="${recordId}"]`);
+            if (!row) return false;
+        }
+
+        row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        await sleep(300); // Allow smooth scroll to settle
+
+        // Click Gear Icon. (Adjust selector based on exact ExtJS implementation)
+        const gearIcon = row.querySelector('.gear-icon, [data-qtip*="Edit"], .x-action-col-icon');
+        if (!gearIcon) return false;
+        gearIcon.click();
+        
+        await sleep(500); // Wait for potential ExtJS menu to drop down
+        
+        // If it opens a menu, find the Edit option
+        const editMenuOption = document.evaluate(
+            "//span[contains(text(), 'Edit')]", 
+            document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+        ).singleNodeValue;
+
+        if (editMenuOption) {
+            editMenuOption.click();
+        }
+
+        // Wait for modal to appear
+        const start = Date.now();
+        while (Date.now() - start < 5000) {
+            const win = document.querySelector('.x-window:not([style*="display: none"])');
+            if (win) return true;
+            await sleep(200);
+        }
+        return false;
+    }
+
+    static async toggleTattooCheckbox(targetStateON) {
+        // Find label "Enable Tattoo"
+        const labelXPath = "//label[contains(text(), 'Enable Tattoo')]";
+        const labelEl = document.evaluate(labelXPath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+        
+        if (!labelEl) return false;
+
+        // In ExtJS, the actual input or the stylized div is usually previous sibling or parent container
+        const formItem = labelEl.closest('.x-form-item');
+        const checkboxEl = formItem ? formItem.querySelector('.x-form-checkbox, input[type="checkbox"]') : null;
+
+        if (!checkboxEl) return false;
+
+        // Check current state (ExtJS adds classes like .x-form-cb-checked)
+        const isCurrentlyON = checkboxEl.className.includes('cb-checked') || checkboxEl.checked;
+
+        if (isCurrentlyON !== targetStateON) {
+            // Simulate full click for Sencha
+            ['mousedown', 'mouseup', 'click'].forEach(eventType => {
+                const event = new MouseEvent(eventType, { bubbles: true, cancelable: true });
+                checkboxEl.dispatchEvent(event);
+            });
+            await sleep(300);
+        }
+        return true;
+    }
+
+    static async saveAndCloseModal() {
+        const saveXPath = "//div[contains(@class, 'x-window')]//span[text()='Save' or text()='Submit']";
+        const saveBtn = document.evaluate(saveXPath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+        
+        if (saveBtn) {
+            saveBtn.click();
+            // 10s Timeout Guard for "Saving..."
+            const maskCleared = await this.waitForMaskClear(10000);
+            if (!maskCleared) {
+                console.warn("[Houston] Save mask timed out. Triggering ESC to cancel.");
+                document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+                await sleep(1000);
+            }
+        }
+        
+        // Ensure modal is completely removed
+        let modal = document.querySelector('.x-window:not([style*="display: none"])');
+        if (modal) {
+            document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+        }
+    }
+}
+
+// ==========================================
+// HUD (SHADOW DOM UI)
+// ==========================================
+class HoustonHUD {
+    constructor() {
+        this.container = document.createElement('div');
+        this.shadow = this.container.attachShadow({ mode: 'open' });
+        document.body.appendChild(this.container);
+        this.initUI();
+        this.loadCSS();
+        this.makeDraggable();
+    }
+
+    async loadCSS() {
+        const cssUrl = chrome.runtime.getURL('styles.css');
+        try {
+            const response = await fetch(cssUrl);
+            const cssText = await response.text();
+            const style = document.createElement('style');
+            style.textContent = cssText;
+            this.shadow.appendChild(style);
+        } catch (e) {
+            console.error("[Houston] Failed to load HUD CSS", e);
+        }
+    }
+
+    initUI() {
+        const wrapper = document.createElement('div');
+        wrapper.id = 'houston-hud';
+        wrapper.innerHTML = `
+            <div class="hud-header">
+                <span>Houston Auto-Tattoo</span>
+                <div class="status-indicator">
+                    <span class="dot idle" id="status-dot"></span>
+                    <span id="status-text">Idle</span>
+                </div>
+            </div>
+            <div class="hud-body">
+                <div class="timer-box">
+                    <div class="label" id="timer-label">AWAITING EVENTS</div>
+                    <div class="time" id="timer-value">--:--</div>
+                </div>
+                <div class="queue-section">
+                    <div class="queue-header">Batch Queue</div>
+                    <ul class="queue-list" id="queue-list"></ul>
+                </div>
+            </div>
+            <div class="hud-footer">
+                <button class="btn-stop" id="btn-stop">STOP ALL</button>
+                <button class="btn-skip" id="btn-skip">SKIP CUR.</button>
+                <button class="btn-purge" id="btn-purge">PURGE</button>
+            </div>
+        `;
+        this.shadow.appendChild(wrapper);
+
+        // Bind buttons
+        this.shadow.getElementById('btn-stop').addEventListener('click', () => engine.emergencyStop());
+        this.shadow.getElementById('btn-skip').addEventListener('click', () => engine.skipCurrent = true);
+        this.shadow.getElementById('btn-purge').addEventListener('click', () => engine.purgeMemory());
+    }
+
+    updateStatus(statusStr, colorClass) {
+        const dot = this.shadow.getElementById('status-dot');
+        const text = this.shadow.getElementById('status-text');
+        dot.className = `dot ${colorClass}`;
+        text.innerText = statusStr;
+    }
+
+    updateTimer(label, secondsRemaining) {
+        this.shadow.getElementById('timer-label').innerText = label;
+        if (secondsRemaining < 0) {
+            this.shadow.getElementById('timer-value').innerText = "--:--";
+        } else {
+            const s = Math.ceil(secondsRemaining);
+            this.shadow.getElementById('timer-value').innerText = `00:${s.toString().padStart(2, '0')}`;
+        }
+    }
+
+    updateQueue(batchA, batchB) {
+        const list = this.shadow.getElementById('queue-list');
+        list.innerHTML = '';
+        const allItems = [...batchA.map(id => ({id, b: 'A'})), ...batchB.map(id => ({id, b: 'B'}))];
+        
+        if (allItems.length === 0) {
+            list.innerHTML = `<li><span style="color:#64748b; font-style:italic;">Queue is empty</span></li>`;
+            return;
+        }
+
+        allItems.forEach(item => {
+            const li = document.createElement('li');
+            li.innerHTML = `<span>[${item.b}] ID: ${item.id}</span> <span>PENDING</span>`;
+            list.appendChild(li);
+        });
+    }
+
+    makeDraggable() {
+        const hud = this.shadow.getElementById('houston-hud');
+        const header = this.shadow.querySelector('.hud-header');
+        let isDragging = false, currentX, currentY, initialX, initialY, xOffset = 0, yOffset = 0;
+
+        header.addEventListener('pointerdown', (e) => {
+            initialX = e.clientX - xOffset;
+            initialY = e.clientY - yOffset;
+            isDragging = true;
+            header.setPointerCapture(e.pointerId);
+        });
+
+        header.addEventListener('pointermove', (e) => {
+            if (isDragging) {
+                e.preventDefault();
+                currentX = e.clientX - initialX;
+                currentY = e.clientY - initialY;
+                xOffset = currentX;
+                yOffset = currentY;
+                hud.style.transform = `translate3d(${currentX}px, ${currentY}px, 0)`;
+            }
+        });
+
+        header.addEventListener('pointerup', (e) => {
+            initialX = currentX;
+            initialY = currentY;
+            isDragging = false;
+            header.releasePointerCapture(e.pointerId);
+        });
+    }
+}
+
+// ==========================================
+// STATE MACHINE & AUTOMATION ENGINE
+// ==========================================
+class HoustonEngine {
+    constructor() {
+        this.hud = new HoustonHUD();
+        this.state = 'IDLE'; // IDLE, BATCH_A_WAIT, PROCESS_A_ON, HOLD_30, PROCESS_A_OFF, BATCH_B_WAIT
+        this.batchA = [];
+        this.batchB = [];
+        this.processedHistory = new Set();
+        
+        this.timerEnd = 0;
+        this.activeTimerType = null; // '15s', '30s'
+        this.skipCurrent = false;
+        this.stopped = false;
+
+        this.loadState();
+        this.startHUDLoop();
+        this.initObserver();
+    }
+
+    async loadState() {
+        const data = await chrome.storage.local.get(['houstonState']);
+        if (data.houstonState) {
+            // Restore basic queues. Complex timer restoration omitted for safety 
+            // to avoid triggering stale actions on a refreshed, outdated DOM.
+            this.processedHistory = new Set(data.houstonState.history || []);
+            console.log("[Houston] State loaded from storage.");
+        }
+    }
+
+    async saveState() {
+        await chrome.storage.local.set({
+            houstonState: { history: Array.from(this.processedHistory) }
+        });
+    }
+
+    // --- Core Observer Trigger ---
+    initObserver() {
+        const targetNode = document.body;
+        const config = { childList: true,
