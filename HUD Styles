@@ -19,6 +19,13 @@
   flex-direction: column;
   overflow: hidden;
   backdrop-filter: blur(10px);
+  transition: transform 0.05s ease;
+}
+
+/* User-Select None during drag via class toggles */
+#houston-hud.dragging {
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .hud-header {
@@ -33,7 +40,7 @@
   border-bottom: 1px solid #334155;
 }
 
-.hud-header:active {
+.hud-header.dragging {
   cursor: grabbing;
 }
 
@@ -112,10 +119,38 @@
   border-bottom: 1px solid #1e293b;
   display: flex;
   justify-content: space-between;
+  align-items: center;
 }
 
 .queue-list li:last-child {
   border-bottom: none;
+}
+
+/* Distinctive styling for queue states */
+.queue-list li.status-active {
+  background: rgba(16, 185, 129, 0.1);
+  border-left: 3px solid #10b981;
+}
+
+.queue-list li.status-pending {
+  border-left: 3px solid transparent; /* Keeps alignment matching */
+}
+
+.badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-weight: bold;
+}
+
+.active-badge {
+  color: #10b981;
+  background: rgba(16, 185, 129, 0.15);
+}
+
+.pending-badge {
+  color: #f59e0b;
+  background: rgba(245, 158, 11, 0.15);
 }
 
 .hud-footer {
