@@ -36,8 +36,15 @@ const extJsMutex = new Mutex();
 // ==========================================
 class ExtJSAPI {
     static isUserModalOpen() {
-        const openWindow = document.querySelector('.x-window:not([style*="display: none"])');
-        return openWindow !== null;
+        // Refined modal detection using computed styles for opacity and visibility
+        const windows = document.querySelectorAll('.x-window');
+        for (let i = 0; i < windows.length; i++) {
+            const style = window.getComputedStyle(windows[i]);
+            if (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0') {
+                return true;
+            }
+        }
+        return false;
     }
 
     static async waitForMaskClear(timeoutMs = 15000) {
@@ -57,7 +64,6 @@ class ExtJSAPI {
     }
 
     static getGridScroller() {
-        // Targets the scrollable container in ExtJS 6/7
         return document.querySelector('.x-grid-item-container')?.parentElement || 
                document.querySelector('.x-scroller') || 
                document.querySelector('.x-panel-body-el.x-scroll-y');
@@ -66,10 +72,8 @@ class ExtJSAPI {
     static async clickGearAndEdit(recordId) {
         let row = document.querySelector(`.x-gridrow[data-recordid="${recordId}"]`);
         
-        // If row is missing, it might be virtualized out. 
-        // We attempt one targeted scroll if we know the ID exists but isn't rendered.
         if (!row) {
-            console.warn(`[Houston] Row ${recordId} not in DOM. Virtual scroll might be active.`);
+            console.warn(`[Houston] Row ${recordId} not in DOM. Attempting targeted scroll...`);
             const scroller = this.getGridScroller();
             if (scroller) {
                 scroller.scrollBy(0, 200);
@@ -83,26 +87,32 @@ class ExtJSAPI {
         row.scrollIntoView({ behavior: 'smooth', block: 'center' });
         await sleep(300);
 
-        const gearIcon = row.querySelector('.fa-cog, .x-action-col-icon, [data-qtip*="Edit"]');
-        if (!gearIcon) return false;
-        gearIcon.click();
-        
-        await sleep(600); 
-        
-        const editMenuOption = document.evaluate(
-            "//div[contains(@class, 'x-menu')]//span[contains(text(), 'Edit')] | //span[contains(text(), 'Edit')]", 
-            document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
-        ).singleNodeValue;
+        // Resilient Gear Click logic - 2 attempts to account for ExtJS render lag
+        for (let attempt = 1; attempt <= 2; attempt++) {
+            const gearIcon = row.querySelector('.fa-cog, .x-action-col-icon, [data-qtip*="Edit"]');
+            if (!gearIcon) return false;
+            
+            // Dispatch mousedown before click to ensure ExtJS registers the interaction
+            gearIcon.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+            gearIcon.click();
+            
+            await sleep(600); 
+            
+            const editMenuOption = document.evaluate(
+                "//div[contains(@class, 'x-menu')]//span[contains(text(), 'Edit')] | //span[contains(text(), 'Edit')]", 
+                document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null
+            ).singleNodeValue;
 
-        if (editMenuOption) {
-            editMenuOption.click();
-        }
+            if (editMenuOption) {
+                editMenuOption.click();
+            }
 
-        const start = Date.now();
-        while (Date.now() - start < 5000) {
-            const win = document.querySelector('.x-window:not([style*="display: none"])');
-            if (win) return true;
-            await sleep(200);
+            const start = Date.now();
+            while (Date.now() - start < 4000) {
+                if (this.isUserModalOpen()) return true;
+                await sleep(200);
+            }
+            console.warn(`[Houston] Gear click attempt ${attempt} failed for ID ${recordId}. Retrying...`);
         }
         return false;
     }
@@ -150,8 +160,7 @@ class ExtJSAPI {
         }
         
         await sleep(500);
-        let modal = document.querySelector('.x-window:not([style*="display: none"])');
-        if (modal) {
+        if (this.isUserModalOpen()) {
             this.forceClose();
         }
     }
@@ -253,7 +262,7 @@ class HoustonHUD {
         }
     }
 
-    updateQueue(batchA, batchB) {
+    updateQueue(batchA, batchB, activeId = null) {
         const list = this.shadow.getElementById('queue-list');
         if(!list) return;
         list.innerHTML = '';
@@ -266,7 +275,15 @@ class HoustonHUD {
 
         allItems.forEach(item => {
             const li = document.createElement('li');
-            li.innerHTML = `<span>[${item.b}] ID: ${item.id}</span> <span>PENDING</span>`;
+            const isActive = item.id === activeId;
+            // Enhanced visual feedback for Active vs Pending
+            if (isActive) {
+                li.classList.add('status-active');
+                li.innerHTML = `<span>[${item.b}] ID: ${item.id}</span> <span class="badge active-badge">ACTIVE</span>`;
+            } else {
+                li.classList.add('status-pending');
+                li.innerHTML = `<span>[${item.b}] ID: ${item.id}</span> <span class="badge pending-badge">PENDING</span>`;
+            }
             list.appendChild(li);
         });
     }
@@ -280,6 +297,8 @@ class HoustonHUD {
             initialX = e.clientX - xOffset;
             initialY = e.clientY - yOffset;
             isDragging = true;
+            header.classList.add('dragging');
+            hud.classList.add('dragging'); // Applies user-select: none
             header.setPointerCapture(e.pointerId);
         });
 
@@ -298,6 +317,8 @@ class HoustonHUD {
             initialX = currentX;
             initialY = currentY;
             isDragging = false;
+            header.classList.remove('dragging');
+            hud.classList.remove('dragging');
             header.releasePointerCapture(e.pointerId);
         });
     }
@@ -313,29 +334,48 @@ class HoustonEngine {
         this.batchA = [];
         this.batchB = [];
         this.batchBTimerEnd = 0;
-        this.processedHistory = new Set();
-        
         this.timerEnd = 0;
+        
+        this.processedHistory = new Set();
+        this.pendingSet = new Set(); // Double-entry protection
+        
         this.skipCurrent = false;
         this.stopped = false;
+        this.currentProcessingId = null; // Track UI state
 
         this.loadState().then(() => {
             this.initObserver();
             this.startEngineLoop();
-            this.startAutoScanLoop(); // New Auto-Scroll Logic
+            this.startAutoScanLoop();
         });
     }
 
     async loadState() {
         const data = await chrome.storage.local.get(['houstonState']);
         if (data.houstonState) {
-            this.processedHistory = new Set(data.houstonState.history || []);
+            const s = data.houstonState;
+            this.processedHistory = new Set(s.history || []);
+            this.pendingSet = new Set(s.pending || []);
+            this.batchA = s.batchA || [];
+            this.batchB = s.batchB || [];
+            this.state = s.state || 'IDLE';
+            this.timerEnd = s.timerEnd || 0;
+            this.batchBTimerEnd = s.batchBTimerEnd || 0;
+            console.log("[Houston] State restored from storage", this.state);
         }
     }
 
     async saveState() {
         await chrome.storage.local.set({
-            houstonState: { history: Array.from(this.processedHistory) }
+            houstonState: { 
+                history: Array.from(this.processedHistory),
+                pending: Array.from(this.pendingSet),
+                batchA: this.batchA,
+                batchB: this.batchB,
+                state: this.state,
+                timerEnd: this.timerEnd,
+                batchBTimerEnd: this.batchBTimerEnd
+            }
         });
     }
 
@@ -348,9 +388,13 @@ class HoustonEngine {
 
     async purgeMemory() {
         this.processedHistory.clear();
+        this.pendingSet.clear();
         this.batchA = [];
         this.batchB = [];
         this.state = 'IDLE';
+        this.timerEnd = 0;
+        this.batchBTimerEnd = 0;
+        this.currentProcessingId = null;
         await this.saveState();
         this.hud.updateQueue([], []);
     }
@@ -359,25 +403,19 @@ class HoustonEngine {
     // AUTO-SCROLL SCANNER
     // ==========================================
     async startAutoScanLoop() {
-        let direction = 1; // 1 for down, -1 for up
+        let direction = 1; 
         while (!this.stopped) {
-            // Only scroll when idle or waiting to avoid messing with modal interaction
             if (this.state === 'IDLE' || this.state === 'BATCH_A_WAIT' || this.state === 'HOLD_30') {
                 const scroller = ExtJSAPI.getGridScroller();
                 if (scroller) {
                     this.hud.setScanning(true);
-                    
-                    // Small incremental scroll to trigger ExtJS row rendering
                     scroller.scrollBy(0, 300 * direction);
-                    
-                    // Check if we hit bottom or top to reverse
                     if (direction === 1 && (scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 10)) {
                         direction = -1;
                     } else if (direction === -1 && scroller.scrollTop <= 10) {
                         direction = 1;
                     }
-                    
-                    await sleep(3000); // Scan every 3 seconds
+                    await sleep(3000); 
                     this.hud.setScanning(false);
                 }
             }
@@ -387,27 +425,30 @@ class HoustonEngine {
 
     initObserver() {
         const config = { childList: true, subtree: true, characterData: true };
-        this.observer = new MutationObserver((mutations) => {
+        this.observer = new MutationObserver(async (mutations) => {
             if (this.stopped) return;
             
             const cells = document.querySelectorAll('.x-grid-cell-inner, .x-gridcell-body-el');
-            cells.forEach(cell => {
+            for (let cell of cells) {
                 const txt = cell.innerText.trim().toLowerCase();
                 if (txt === 'live') { 
                     const row = cell.closest('.x-gridrow');
                     if (row) {
                         const recordId = row.getAttribute('data-recordid');
-                        if (recordId && !this.processedHistory.has(recordId) && !this.batchA.includes(recordId) && !this.batchB.includes(recordId)) {
-                            this.handleLiveEventDetected(recordId);
+                        // Added Pending Set check to prevent double-entry from excessive mutations
+                        if (recordId && !this.processedHistory.has(recordId) && !this.pendingSet.has(recordId)) {
+                            await this.handleLiveEventDetected(recordId);
                         }
                     }
                 }
-            });
+            }
         });
         this.observer.observe(document.body, config);
     }
 
     async handleLiveEventDetected(recordId) {
+        this.pendingSet.add(recordId); // Lock the ID locally immediately
+
         if (this.state === 'IDLE') {
             this.batchA.push(recordId);
             this.transitionTo('BATCH_A_WAIT', 15);
@@ -415,7 +456,8 @@ class HoustonEngine {
             this.batchA.push(recordId);
         } else if (this.state === 'HOLD_30') {
             this.batchA.push(recordId);
-            this.hud.updateQueue(this.batchA, this.batchB);
+            this.hud.updateQueue(this.batchA, this.batchB, this.currentProcessingId);
+            // Wait out the currently running flow, then inject it directly
             await this.executeAction(recordId, true);
         } else if (this.state === 'PROCESS_A_OFF') {
             this.batchB.push(recordId);
@@ -423,7 +465,8 @@ class HoustonEngine {
                 this.batchBTimerEnd = Date.now() + 15000;
             }
         }
-        this.hud.updateQueue(this.batchA, this.batchB);
+        await this.saveState();
+        this.hud.updateQueue(this.batchA, this.batchB, this.currentProcessingId);
     }
 
     transitionTo(newState, seconds) {
@@ -431,6 +474,7 @@ class HoustonEngine {
         if (seconds) {
             this.timerEnd = Date.now() + (seconds * 1000);
         }
+        this.saveState(); // Persist transition phase
     }
 
     updateHUD() {
@@ -461,7 +505,7 @@ class HoustonEngine {
 
         this.hud.updateTimer(label, remain);
         this.hud.updateStatus(status, color);
-        this.hud.updateQueue(this.batchA, this.batchB);
+        this.hud.updateQueue(this.batchA, this.batchB, this.currentProcessingId);
     }
 
     async startEngineLoop() {
@@ -469,6 +513,7 @@ class HoustonEngine {
             await sleep(500);
             this.updateHUD();
 
+            // Modal Check is secure since the Engine loop rests while actual executing is happening
             if (ExtJSAPI.isUserModalOpen() && (this.state === 'PROCESS_A_ON' || this.state === 'PROCESS_A_OFF')) {
                 this.hud.updateStatus('PAUSED (User Modal)', 'waiting');
                 continue;
@@ -482,7 +527,12 @@ class HoustonEngine {
             else if (this.state === 'PROCESS_A_ON') {
                 for (let id of [...this.batchA]) {
                     if (this.skipCurrent) { this.skipCurrent = false; continue; }
+                    this.currentProcessingId = id;
+                    this.updateHUD();
+                    
                     await this.executeAction(id, true);
+                    
+                    this.currentProcessingId = null;
                 }
                 this.transitionTo('HOLD_30', 30);
             } 
@@ -494,8 +544,12 @@ class HoustonEngine {
             else if (this.state === 'PROCESS_A_OFF') {
                 for (let id of [...this.batchA]) {
                     if (this.skipCurrent) { this.skipCurrent = false; continue; }
+                    this.currentProcessingId = id;
+                    this.updateHUD();
+                    
                     await this.executeAction(id, false);
                     this.processedHistory.add(id);
+                    this.currentProcessingId = null;
                 }
                 
                 this.batchA = [];
@@ -507,6 +561,7 @@ class HoustonEngine {
                     const remaining = Math.max(0, (this.batchBTimerEnd - Date.now()) / 1000);
                     this.transitionTo('BATCH_A_WAIT', remaining);
                     this.batchBTimerEnd = 0;
+                    await this.saveState();
                 } else {
                     this.transitionTo('IDLE', 0);
                 }
